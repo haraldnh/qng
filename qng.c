@@ -1,15 +1,12 @@
 /*
  * Driver for the ComScire Quantum Noise Generator.
- * Version 0.7 for the Linux 2.6 series kernel.
+ * Version 0.8 for modern kernels.
  *
- * Copyright (C) 1999,2007 by Harald Nordgård-Hansen (hhansen@pvv.org)
+ * Copyright (C) 1999,2013 by Harald NordgÃ¥rd-Hansen (hhansen@pvv.org)
  * Copying and other stuff permitted in accordance with the GPL.
  * NO WARRANTY, if it breaks, you get to keep both pieces.
  *
- * This driver was written using lp.c as an example.  Thanks to the
- * authors of that and other easily-read code in the kernel.
- *
- * Also thanks to Scott Wilber of ComScire for excellent help in
+ * Thanks to Scott Wilber of ComScire for excellent help in
  * understanding how the device works.
  */
 
@@ -18,19 +15,15 @@
  * reads and writes on the port, it should in theory work with any
  * parallel port through the parport abstractions.
  *
- * When the module is loaded, it can be configured using the parameter parport:
- *
- *	# insmod qng.o parport=1
- *	# insmod qng.o parport=auto (default)
- *
- * Please note that if you autoprobe for qng devices before setting
- * up your printers, and this driver probes for qng on a port that
- * has a printer connected, some small amount of output might occur.
- * This is due to the need for writing a couple of bytes to the data-
- * port as part of the probing sequence.
- * If the port is already claimed (shareable) by the lp driver (as should
- * usually happen), this driver will be denied exclusive access to
- * the port, and will (in theory) just stay away.
+ * When the module is loaded, it will probe available parallell ports
+ * for qng devices.  Please note that if this probe for qng devices
+ * happens before setting up any printers, and this driver probes for
+ * qng on a port that has a printer connected, some small amount of
+ * output might occur.  This is due to the need for writing a couple
+ * of bytes to the dataport as part of the probing sequence.  If the
+ * port is already claimed (shareable) by the lp driver (as should
+ * usually happen), this driver will be denied exclusive access to the
+ * port, and will (in theory) just stay away.
  *
  * With respect to interrupts, since the driver keeps the port claimed
  * at all times when interrupts are enabled, it is impossible to turn
@@ -54,10 +47,12 @@
 #include <linux/sched.h>
 #include <linux/fcntl.h>
 #include <linux/delay.h>
+#include <linux/device.h>
+#include <linux/semaphore.h>
+#include <linux/slab.h>
 
 #include <asm/irq.h>
 #include <asm/uaccess.h>
-#include <asm/system.h>
 
 #include <linux/parport.h>
 
@@ -109,22 +104,19 @@
 
 /* defines for bit positions of flags */
 #define QNG_EXIST 0
-#define QNG_BUSY 1
-#define QNG_HAS_INTS 2
-#define QNG_COUNT_INTS 3
-#define QNG_PORT_CLAIMED 4
-
-/* defines for port-device mappings. */
-#define QNG_PARPORT_UNSPEC -4
-#define QNG_PARPORT_AUTO -3
-#define QNG_PARPORT_OFF -2
-#define QNG_PARPORT_NONE -1
+#define QNG_HAS_INTS 1
+#define QNG_COUNT_INTS 2
+#define QNG_PORT_CLAIMED 3
 
 /* size of buffer used by interrupt routine */
-#define QNG_BUFFER_SIZE 4096
+#define QNG_BUFFER_SIZE 262144
 
 typedef struct _qng_struct {
-	struct pardevice * dev;
+	struct parport *port;
+	struct pardevice *pdev;
+	wait_queue_head_t wq;
+	int use_count;
+	struct semaphore lock;
 	volatile unsigned long flags;
 	volatile int halfstate;
 	volatile int head;
@@ -134,20 +126,18 @@ typedef struct _qng_struct {
 	unsigned char * volatile buffer;
 } qng_struct;
 
-static qng_struct qng_data[QNG_NO] =
-{
-	[0 ... QNG_NO-1] = {NULL, 0, 0, 0, 0, 0, 0, NULL}
-};
+static qng_struct qng_data[QNG_NO];
+static struct class *devclass = NULL;
 
 /* --- low-level port access ----------------------------------- */
 
-#define r_str(x) (parport_read_status(qng_data[x].dev->port))
-#define w_dtr(x,y) parport_write_data(qng_data[x].dev->port, (y))
+#define r_str(x) (parport_read_status(qng_data[x].port))
+#define w_dtr(x,y) parport_write_data(qng_data[x].port, (y))
 
 /* If we're running with interrupts, then fetch each nibble here,
    and stuff it into a ring buffer.  This should increase the speed
    of small reads enormously. */
-static void qng_interrupt(int irq, void *dev)
+static void qng_interrupt(void *dev)
 {
 	unsigned char nibble;
 	int n;
@@ -160,17 +150,12 @@ static void qng_interrupt(int irq, void *dev)
 
 	if(data->bufsize == 0) return;
 
-#if 0 /* no need, this cannot happen it seems. */
-	if(! test_and_set_bit(QNG_HAS_INTS,&(data->flags))) {
-#if QNG_DEBUG >= 1
-		printk(KERN_INFO "qng: detected irq %d on %s\n",
-		       irq, data->dev->port->name)
-#endif
-			;
-	}
-#endif
+	/* Bail out if queueu is already full */
+	if( ((data->head + 1) == data->tail) ||
+	    (((data->head + 1) >= data->bufsize) && (data->tail == 0)) )
+		return;
 
-	n = parport_read_status(data->dev->port);
+	n = parport_read_status(data->port);
 	nibble = ((n & 0x80)>>4) + ((n & 0x38)>>3);
 	if(data->halfstate == 0) {
 		data->halfstate = 1;
@@ -179,8 +164,9 @@ static void qng_interrupt(int irq, void *dev)
 		data->halfstate = 0;
 		data->buffer[data->head] |= (nibble << 4);
 		data->head++;
-		if(data->head == data->tail) data->head--;
-		else if(data->head >= data->bufsize) data->head = 0;
+		if(data->head >= data->bufsize)
+			data->head = 0;
+		wake_up_interruptible(&data->wq);
 	}
 }
 
@@ -188,26 +174,27 @@ static void qng_interrupt(int irq, void *dev)
 #define NIBBLE_POLL_DELAY (HZ+99/100)
 static int qng_read_nibble(int nr)
 {
-     int i,j,n=0;
+	long unsigned int i,j;
+	int n=0;
 
-     /* Wait for nibble start (to only read a nibble once). */
-     for(i=j=jiffies; j-i < NIBBLE_POLL_DELAY && (r_str(nr) & 0x40);) {
-	     j = jiffies;
-     }
-     if(j-i >= NIBBLE_POLL_DELAY) {
-	     /* This shouldn't happen... */
-	     printk(KERN_ERR "qng: timed out in readnibble.\n");
-	     return(-1);
-     }
-     /* Wait for nibble ready. */
-     for(i=j=jiffies; j-i < NIBBLE_POLL_DELAY && !((n=r_str(nr)) & 0x40);) {
-	     j = jiffies;
-     }
-     if(j-i >= NIBBLE_POLL_DELAY) {
-	     printk(KERN_ERR "qng: timed out in readnibble.\n");
-	     return(-1);
-     }
-     return(((n & 0x80)>>4) + ((n & 0x38)>>3));
+	/* Wait for nibble start (to only read a nibble once). */
+	for(i=j=jiffies; j-i < NIBBLE_POLL_DELAY && (r_str(nr) & 0x40);) {
+		j = jiffies;
+	}
+	if(j-i >= NIBBLE_POLL_DELAY) {
+		/* This shouldn't happen... */
+		printk(KERN_ERR "qng: timed out in readnibble.\n");
+		return(-1);
+	}
+	/* Wait for nibble ready. */
+	for(i=j=jiffies; j-i < NIBBLE_POLL_DELAY && !((n=r_str(nr)) & 0x40);) {
+		j = jiffies;
+	}
+	if(j-i >= NIBBLE_POLL_DELAY) {
+		printk(KERN_ERR "qng: timed out in readnibble.\n");
+		return(-1);
+	}
+	return(((n & 0x80)>>4) + ((n & 0x38)>>3));
 }
 
 static ssize_t qng_read_polled(unsigned int minor, char *buf, size_t length)
@@ -218,7 +205,10 @@ static ssize_t qng_read_polled(unsigned int minor, char *buf, size_t length)
 	char *tmp = buf;
 
 	for(count = 0; count < length; count++) {
+		if (down_interruptible(&qng_data[minor].lock))
+			return -ERESTARTSYS;
 		t = (qng_read_nibble(minor)<<4) + qng_read_nibble(minor);
+		up(&qng_data[minor].lock);
 		if(t == -1) return -EIO;
 		c = t & 0xff;
 		if(__put_user(c, tmp)) return -EFAULT;
@@ -226,52 +216,106 @@ static ssize_t qng_read_polled(unsigned int minor, char *buf, size_t length)
 		/* This kills some speed on the device, as we will
 		   miss some nibbles, but the machine becomes _much_
 		   more responsive for other use... */
-		cond_resched();
+		schedule();
 	}
 	return count;
 }
 
 /* The maximum amount of time to wait for the interrupt routine to
-   generate more data. */
-#define INTERRUPT_WAIT (10*HZ+99)/100
-static ssize_t qng_read_intr(unsigned int minor, char *buf, size_t length)
+   generate more data.  With multiple readers, this can be quite large
+   witout being broken, so set it quite high. */
+#define INTERRUPT_WAIT 4*HZ
+static ssize_t qng_read_intr(struct file *file, char *buf, size_t length)
 {
-	ssize_t count;
-	int i, j;
+	ssize_t count = 0;
+	int i;
 	char *tmp = buf;
+	unsigned int minor = MINOR(file->f_dentry->d_inode->i_rdev);
+	qng_struct *data = &qng_data[minor];
 
-	count = 0;
-	j = jiffies;
-	while(count < length) {
-		i = qng_data[minor].head - qng_data[minor].tail;
-		if(i < 0) i += qng_data[minor].bufsize;
-		if(i > 0) {
-			if(__put_user(qng_data[minor].buffer[qng_data[minor].tail], tmp))
+	/* First satisfy as much as possible from the buffer */
+	if (down_interruptible(&data->lock))
+		return -ERESTARTSYS;
+	if (data->head != data->tail) {
+		if (data->head > data->tail) {
+			count = min(length, (size_t)(data->head - data->tail));
+			if (copy_to_user(tmp, &data->buffer[data->tail],
+					 count)) {
+				up(&data->lock);
 				return -EFAULT;
-			tmp++;
-			count++;
-			qng_data[minor].tail++;
-			if(qng_data[minor].tail >= qng_data[minor].bufsize)
-				qng_data[minor].tail = 0;
-			j = jiffies;
-		} else {
-			/* Let's wait for the interrupt routine to
-			   receive more data... */
-			if(jiffies - j >= INTERRUPT_WAIT) {
-				printk(KERN_ERR
-				       "qng: timed out waiting for ints.\n");
-#if QNG_DEBUG >= 1
-				printk(KERN_INFO
-				       "qng: turning off interrupts on %s.\n",
-				       qng_data[minor].dev->port->name);
-#endif
-				clear_bit(QNG_HAS_INTS,
-					  &(qng_data[minor].flags));
-				return -EIO;
 			}
-			cond_resched();
+			data->tail += count;
+			tmp += count;
+		} else {
+			count = min(length,
+				    (size_t)(data->bufsize - data->tail));
+			if (copy_to_user(tmp, &data->buffer[data->tail],
+					 count)) {
+				up(&data->lock);
+				return -EFAULT;
+			}
+			data->tail += count;
+			tmp += count;
+			if (data->tail >= data->bufsize)
+				data->tail = 0;
+			if (count < length) {
+				i = min((int)(length - count), data->head);
+				if (copy_to_user(tmp, data->buffer, i)) {
+					up(&data->lock);
+					return -EFAULT;
+				}
+				data->tail = i;
+				count += i;
+				tmp += i;
+			}
 		}
 	}
+	if (count == length) {
+		up(&data->lock);
+		return count;
+	}
+	if (file->f_flags & O_NONBLOCK) {
+		up(&data->lock);
+		if (count) return count;
+		else return -EAGAIN;
+	}
+
+	/* We need to wait for data to become available */
+	while (count < length) {
+		while ((count < length) && (data->tail != data->head)) {
+			if (__put_user(data->buffer[data->tail], tmp)) {
+				up(&data->lock);
+				return -EFAULT;
+			}
+			tmp++;
+			count++;
+			data->tail++;
+			if (data->tail >= data->bufsize)
+				data->tail = 0;
+		}
+		if (count == length) break;
+
+		up(&data->lock);
+		i = wait_event_interruptible_timeout(data->wq,
+						     data->tail != data->head,
+						     INTERRUPT_WAIT);
+		if (i < 0) {
+			return -ERESTARTSYS;
+		}
+		if (i == 0) {
+			printk(KERN_ERR "qng: timed out waiting for ints.\n");
+#if QNG_DEBUG >= 1
+			printk(KERN_INFO "qng: turning off interrupts on %s.\n",
+			       data->port->name);
+#endif
+			clear_bit(QNG_HAS_INTS, &data->flags);
+			return -EIO;
+		}
+		if (down_interruptible(&data->lock))
+			return -ERESTARTSYS;
+	}
+
+	up(&data->lock);
 	return count;
 }
 
@@ -281,12 +325,12 @@ static ssize_t qng_read(struct file * file, char * buf,
 	unsigned int minor=MINOR(file->f_dentry->d_inode->i_rdev);
 
 	if(test_bit(QNG_HAS_INTS,&(qng_data[minor].flags)) &&
-	   qng_data[minor].dev->port->irq == PARPORT_IRQ_NONE)
+	   qng_data[minor].port->irq == PARPORT_IRQ_NONE)
 		clear_bit(QNG_HAS_INTS, &(qng_data[minor].flags));
 
 	if(test_bit(QNG_HAS_INTS,&(qng_data[minor].flags)) &&
 		qng_data[minor].bufsize > 0)
-		return(qng_read_intr(minor,buf,length));
+		return(qng_read_intr(file,buf,length));
 	else
 		return(qng_read_polled(minor,buf,length));
 }
@@ -299,19 +343,21 @@ static int qng_open(struct inode * inode, struct file * file)
 		return -ENXIO;
 	if (!test_bit(QNG_EXIST,&(qng_data[minor].flags)))
 		return -ENXIO;
-	if (test_and_set_bit(QNG_BUSY, &(qng_data[minor].flags)))
-		/* only one accessor at any moment */
+
+	/* Put a (high) limit on number of concurrent users */
+	if (qng_data[minor].use_count >= 50)
 		return -EBUSY;
 
-	if(!test_and_set_bit(QNG_PORT_CLAIMED, &(qng_data[minor].flags)))
-		parport_claim(qng_data[minor].dev);
+	if ((qng_data[minor].use_count == 0) &&
+	    (!test_and_set_bit(QNG_PORT_CLAIMED, &(qng_data[minor].flags))))
+		parport_claim(qng_data[minor].pdev);
+	qng_data[minor].use_count++;
 	if(!test_bit(QNG_HAS_INTS, &(qng_data[minor].flags)) &&
-	   qng_data[minor].dev->port->irq != PARPORT_IRQ_NONE) {
+	   qng_data[minor].port->irq != PARPORT_IRQ_NONE) {
 		set_bit(QNG_HAS_INTS, &(qng_data[minor].flags));
 		printk(KERN_INFO "qng: detected interrupts on %s\n",
-		       qng_data[minor].dev->port->name);
-		qng_data[minor].dev->port->ops->enable_irq
-			(qng_data[minor].dev->port);
+		       qng_data[minor].port->name);
+		qng_data[minor].port->ops->enable_irq(qng_data[minor].port);
 	}
 #if QNG_DEBUG >= 3
 	printk(KERN_INFO "qng: Open with minor at %d, using %s\n", minor,
@@ -325,11 +371,12 @@ static int qng_release(struct inode * inode, struct file * file)
 {
 	unsigned int minor = MINOR(inode->i_rdev);
 
-	if(!test_bit(QNG_HAS_INTS, &(qng_data[minor].flags)) &&
-	   test_and_clear_bit(QNG_PORT_CLAIMED, &(qng_data[minor].flags)))
-		parport_release(qng_data[minor].dev);
+	qng_data[minor].use_count--;
+	if ((qng_data[minor].use_count == 0) &&
+	    !test_bit(QNG_HAS_INTS, &(qng_data[minor].flags)) &&
+	    test_and_clear_bit(QNG_PORT_CLAIMED, &(qng_data[minor].flags)))
+		parport_release(qng_data[minor].pdev);
 
-	clear_bit(QNG_BUSY, &(qng_data[minor].flags));
 	return 0;
 }
 
@@ -341,13 +388,6 @@ static struct file_operations qng_fops = {
 };
 
 /* --- initialisation code ------------------------------------- */
-
-static int parport_nr[QNG_NO] = { [0 ... QNG_NO-1] = QNG_PARPORT_UNSPEC };
-static char *parport[QNG_NO] = { NULL,  };
-
-MODULE_AUTHOR("Harald Nordgård-Hansen <hhansen@pvv.org>");
-MODULE_DESCRIPTION("ComScire Quantum Noise Generator (/dev/qng) driver");
-MODULE_LICENSE("GPLv2");
 
 int qng_count_transitions(int nr, int time) { /* time in msec */
 	if(test_bit(QNG_HAS_INTS, &(qng_data[nr].flags))) {
@@ -420,158 +460,133 @@ int qng_validate(int nr) {
 }
 
 
-int qng_register(int nr, struct parport *port)
+static void qng_attach(struct parport *port)
 {
-	static int did_version = 0;
+	int i;
+	dev_t devt;
 
-	qng_data[nr].dev = parport_register_device(port, "qng", 
-						   NULL, NULL,
-						   qng_interrupt,
+	for (i = 0; i < QNG_NO; i++ )
+		if(qng_data[i].port == NULL)
+			break;
+	if (i == QNG_NO) {
+		printk(KERN_WARNING "qng: No space for more devices.");
+		return;
+	}
+
+	qng_data[i].pdev = parport_register_device(port, KBUILD_MODNAME, 
+						   NULL, NULL, qng_interrupt,
 						   PARPORT_FLAG_EXCL,
-						   (void *)&qng_data[nr]);
-	if (qng_data[nr].dev == NULL)
-		return 1;
-	if(did_version++ == 0)
-		printk(KERN_INFO "qng.c v0.7");
-	set_bit(QNG_PORT_CLAIMED, &(qng_data[nr].flags));
-	parport_claim(qng_data[nr].dev);
+						   &qng_data[i]);
+	if (qng_data[i].pdev == NULL)
+		return;
+	qng_data[i].port = port;
+	set_bit(QNG_PORT_CLAIMED, &(qng_data[i].flags));
+	parport_claim(qng_data[i].pdev);
 	if (port->irq != PARPORT_IRQ_NONE) {
-		set_bit(QNG_HAS_INTS, &(qng_data[nr].flags));
+		set_bit(QNG_HAS_INTS, &(qng_data[i].flags));
 		port->ops->enable_irq(port);
 	}
-	if (qng_validate(nr)) {
-		clear_bit(QNG_HAS_INTS, &(qng_data[nr].flags));
-		if(test_and_clear_bit(QNG_PORT_CLAIMED, &(qng_data[nr].flags)))
-			parport_release(qng_data[nr].dev);
-		parport_unregister_device(qng_data[nr].dev);
-		qng_data[nr].dev = NULL;
-		return 1;
+	if (qng_validate(i)) {
+		clear_bit(QNG_HAS_INTS, &(qng_data[i].flags));
+		if(test_and_clear_bit(QNG_PORT_CLAIMED, &(qng_data[i].flags)))
+			parport_release(qng_data[i].pdev);
+		parport_unregister_device(qng_data[i].pdev);
+		qng_data[i].pdev = NULL;
+		qng_data[i].port = NULL;
+		return;
 	}
-	set_bit(QNG_EXIST, &(qng_data[nr].flags));
-	if(!test_bit(QNG_HAS_INTS, &(qng_data[nr].flags)) &&
-	   test_and_clear_bit(QNG_PORT_CLAIMED, &(qng_data[nr].flags)))
-		parport_release(qng_data[nr].dev);
+	set_bit(QNG_EXIST, &(qng_data[i].flags));
+	if(!test_bit(QNG_HAS_INTS, &(qng_data[i].flags)) &&
+	   test_and_clear_bit(QNG_PORT_CLAIMED, &(qng_data[i].flags)))
+		parport_release(qng_data[i].pdev);
 	printk(KERN_INFO "qng: using %s (%s).\n", port->name,
 	       (port->irq == PARPORT_IRQ_NONE) ?
 	       "with polling" : "interrupt-driven");
 
-	return 0;
-}
-
-int qng_init(void)
-{
-	unsigned int count = 0;
-	unsigned int i;
-	struct parport *port;
-
-	switch (parport_nr[0])
-	{
-	case QNG_PARPORT_OFF:
-		return 0;
-
-	case QNG_PARPORT_UNSPEC:
-	case QNG_PARPORT_AUTO:
-		for (port = parport_enumerate(); port; port = port->next) {
-			if (!qng_register(count, port))
-				if(++count == QNG_NO)
-					break;
-		}
-		break;
-
-	default:
-		for (i = 0; i < QNG_NO; i++) {
-			for (port = parport_enumerate(); port;
-			     port = port->next) {
-				if (port->number == parport_nr[i]) {
-					if (!qng_register(i, port))
-						count++;
-					break;
-				}
-			}
-		}
-		break;
-	}
-
-	if (count) {
-		if (register_chrdev(QNG_MAJOR, "qng", &qng_fops)) {
-			printk(KERN_ERR "qng: unable to get major %d\n",
-			       QNG_MAJOR);
-			for(i = 0; i < QNG_NO; i++)
-				if(qng_data[i].dev) {
-					if(test_and_clear_bit(QNG_PORT_CLAIMED, &(qng_data[i].flags)))
-						parport_release(qng_data[i].dev);
-					parport_unregister_device(
-						qng_data[i].dev);
-				}
-			return -EIO;
-		}
+	/* Do final setup for device... */
+	init_waitqueue_head(&qng_data[i].wq);
+	sema_init(&qng_data[i].lock, 1);
+	qng_data[i].buffer = (char *) kmalloc(QNG_BUFFER_SIZE, GFP_KERNEL);
+	if (!qng_data[i].buffer) {
+		printk(KERN_ERR "qng: unable to allocate "
+		       "internal buffer.  Will not make "
+		       "use of interrupts.\n");
+		qng_data[i].bufsize = 0;
 	} else {
-#if QNG_DEBUG >= 1
-		printk(KERN_INFO "qng: driver loaded but no devices found\n");
-#endif
-		return 0;
+		qng_data[i].bufsize = QNG_BUFFER_SIZE;
 	}
-	/* Do final setup for each device... */
-	for (i = 0; i < QNG_NO; i++) {
-		if(test_bit(QNG_EXIST,&(qng_data[i].flags))) {
-			qng_data[i].buffer =
-				(char *) kmalloc(QNG_BUFFER_SIZE, GFP_KERNEL);
-			if (!qng_data[i].buffer) {
-				printk(KERN_ERR "qng: unable to allocate "
-				       "internal buffer.  Will not make "
-				       "use of interrupts.\n");
-				qng_data[i].bufsize = 0;
-			} else {
-				qng_data[i].bufsize = QNG_BUFFER_SIZE;
-			}
-		}
-	}
-#if QNG_DEBUG >= 1
-	printk(KERN_INFO "qng: driver ready.\n");
-#endif
-	return 0;
+	qng_data[i].head = qng_data[i].tail = qng_data[i].halfstate = 0;
+	devt = MKDEV(QNG_MAJOR, i);
+	device_create(devclass, NULL, devt, NULL, "qng%d", i);
 }
 
-int init_module(void)
-{
-	if (parport[0]) {
-		/* The user gave some parameters.  Let's take a look. */
-		if (!strcmp(parport[0], "auto"))
-			parport_nr[0] = QNG_PARPORT_AUTO;
-		else {
-			int n;
-			for (n = 0; n < QNG_NO && parport[n]; n++) {
-				if (!strcmp(parport[n], "none"))
-					parport_nr[n] = QNG_PARPORT_NONE;
-				else {
-					char *ep;
-					unsigned long r = simple_strtoul(parport[n], &ep, 0);
-					if (ep != parport[n])
-						parport_nr[n] = r;
-					else {
-						printk(KERN_ERR "qng: bad port specifier '%s'\n", parport[n]);
-						return -ENODEV;
-					}
-				}
-			}
-		}
-	}
-	return qng_init();
-}
-
-void cleanup_module(void)
+static void qng_detach(struct parport *port)
 {
 	int i;
+	dev_t devt;
 
-	unregister_chrdev(QNG_MAJOR, "qng");
-	for(i = 0; i < QNG_NO; i++)
-		if(qng_data[i].dev) {
-			if(test_and_clear_bit(QNG_PORT_CLAIMED,
-					      &(qng_data[i].flags)))
-				parport_release(qng_data[i].dev);
-			parport_unregister_device(qng_data[i].dev);
+	for (i = 0; i < QNG_NO; i++) {
+		if(qng_data[i].port == port) {
+			devt = MKDEV(QNG_MAJOR, i);
+			device_destroy(devclass, devt);
+			/* Power down */
+			parport_write_data(port, 0);
+			parport_release(qng_data[i].pdev);
+			parport_unregister_device(qng_data[i].pdev);
+			if(qng_data[i].buffer != NULL)
+				kfree(qng_data[i].buffer);
+			qng_data[i].port = NULL;
+			qng_data[i].pdev = NULL;
+			qng_data[i].flags = 0;
+			qng_data[i].bufsize = 0;
+			qng_data[i].buffer = NULL;
+			break;
 		}
+	}
 }
+
+
+static struct parport_driver qng_driver = {
+	.name = KBUILD_MODNAME,
+	.attach = qng_attach,
+	.detach = qng_detach,
+};
+
+static int __init qng_init_module(void)
+{
+	int ret;
+
+	printk(KERN_INFO "qng.c v0.8");
+
+	ret = register_chrdev(QNG_MAJOR, "qng", &qng_fops);
+	
+	if (ret)
+		printk(KERN_ERR "qng: unable to get major %d\n", QNG_MAJOR);
+
+	if (ret == 0) {
+		devclass = class_create(THIS_MODULE, "qng");
+		ret = parport_register_driver(&qng_driver);
+		if (ret) {
+			printk(KERN_ERR "qng: Unable to register for parport");
+			unregister_chrdev(QNG_MAJOR, "qng");
+		}
+	}
+	return ret;
+}
+
+static void __exit qng_cleanup_module(void)
+{
+	unregister_chrdev(QNG_MAJOR, "qng");
+	parport_unregister_driver(&qng_driver);
+	class_destroy(devclass);
+}
+
+module_init(qng_init_module);
+module_exit(qng_cleanup_module);
+
+MODULE_AUTHOR("Harald NordgÃ¥rd-Hansen <hhansen@pvv.org>");
+MODULE_DESCRIPTION("ComScire Quantum Noise Generator (/dev/qng) driver");
+MODULE_LICENSE("GPL v2");
 
 /*
  * Local variables:
