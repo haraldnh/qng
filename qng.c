@@ -1,8 +1,8 @@
 /*
  * Driver for the ComScire Quantum Noise Generator.
- * $Id: qng.c,v 0.6 1999/08/06 15:52:48 hnh Exp $
+ * Version 0.7 for the Linux 2.6 series kernel.
  *
- * Copyright (C) 1999 by Harald Nordgård-Hansen (hnh@hiof.no)
+ * Copyright (C) 1999,2007 by Harald Nordgård-Hansen (hhansen@pvv.org)
  * Copying and other stuff permitted in accordance with the GPL.
  * NO WARRANTY, if it breaks, you get to keep both pieces.
  *
@@ -13,22 +13,12 @@
  * understanding how the device works.
  */
 
-static const char version[] = "qng.c:$Revision: 0.6 $ $Date: 1999/08/06 15:52:48 $ hnh@hiof.no\n";
-
 /*
  * While the driver is somewhat specific with respect to which bits it
  * reads and writes on the port, it should in theory work with any
  * parallel port through the parport abstractions.
  *
- * If the driver is built into the kernel, it can be configured using
- * the kernel command-line, as in:
- *
- *	qng=parport1		(The qng device is connected to parport1)
- *	qng=auto (default)	(At some point, perhaps autodetecting
- * 				the device might be supported.)
- *
- * If the driver is loaded as a module, the module is similarily
- * configured using the module parameter parport:
+ * When the module is loaded, it can be configured using the parameter parport:
  *
  *	# insmod qng.o parport=1
  *	# insmod qng.o parport=auto (default)
@@ -58,12 +48,10 @@ static const char version[] = "qng.c:$Revision: 0.6 $ $Date: 1999/08/06 15:52:48
 #include <linux/module.h>
 #include <linux/init.h>
 
-#include <linux/config.h>
 #include <linux/errno.h>
 #include <linux/kernel.h>
 #include <linux/major.h>
 #include <linux/sched.h>
-#include <linux/malloc.h>
 #include <linux/fcntl.h>
 #include <linux/delay.h>
 
@@ -137,7 +125,7 @@ static const char version[] = "qng.c:$Revision: 0.6 $ $Date: 1999/08/06 15:52:48
 
 typedef struct _qng_struct {
 	struct pardevice * dev;
-	volatile int flags;
+	volatile unsigned long flags;
 	volatile int halfstate;
 	volatile int head;
 	volatile int tail;
@@ -159,7 +147,7 @@ static qng_struct qng_data[QNG_NO] =
 /* If we're running with interrupts, then fetch each nibble here,
    and stuff it into a ring buffer.  This should increase the speed
    of small reads enormously. */
-static void qng_interrupt(int irq, void *dev, struct pt_regs *regs)
+static void qng_interrupt(int irq, void *dev)
 {
 	unsigned char nibble;
 	int n;
@@ -238,8 +226,7 @@ static ssize_t qng_read_polled(unsigned int minor, char *buf, size_t length)
 		/* This kills some speed on the device, as we will
 		   miss some nibbles, but the machine becomes _much_
 		   more responsive for other use... */
-		if(current->need_resched)
-			schedule();
+		cond_resched();
 	}
 	return count;
 }
@@ -282,8 +269,7 @@ static ssize_t qng_read_intr(unsigned int minor, char *buf, size_t length)
 					  &(qng_data[minor].flags));
 				return -EIO;
 			}
-			if(current->need_resched)
-				schedule();
+			cond_resched();
 		}
 	}
 	return count;
@@ -332,8 +318,6 @@ static int qng_open(struct inode * inode, struct file * file)
 	       (test_bit(QNG_HAS_INTS,&(qng_data[minor].flags))?
 		       "interrupts":"polling"));
 #endif
-
-	MOD_INC_USE_COUNT;
 	return 0;
 }
 
@@ -345,69 +329,25 @@ static int qng_release(struct inode * inode, struct file * file)
 	   test_and_clear_bit(QNG_PORT_CLAIMED, &(qng_data[minor].flags)))
 		parport_release(qng_data[minor].dev);
 
-	MOD_DEC_USE_COUNT;
 	clear_bit(QNG_BUSY, &(qng_data[minor].flags));
 	return 0;
 }
 
 
 static struct file_operations qng_fops = {
-	NULL,		/* qng_lseek */
-	qng_read,
-	NULL,		/* qng_write */
-	NULL,		/* qng_readdir */
-	NULL,		/* qng_poll */
-	NULL,		/* qng_ioctl */
-	NULL,		/* qng_mmap */
-	qng_open,
-	NULL,		/* flush */
-	qng_release
+	.read    = qng_read,
+	.open    = qng_open,
+	.release = qng_release
 };
 
 /* --- initialisation code ------------------------------------- */
 
-#ifdef MODULE
 static int parport_nr[QNG_NO] = { [0 ... QNG_NO-1] = QNG_PARPORT_UNSPEC };
 static char *parport[QNG_NO] = { NULL,  };
 
-MODULE_AUTHOR("Harald Nordgård-Hansen <hnh@hiof.no>");
+MODULE_AUTHOR("Harald Nordgård-Hansen <hhansen@pvv.org>");
 MODULE_DESCRIPTION("ComScire Quantum Noise Generator (/dev/qng) driver");
-MODULE_PARM(parport, "1-" __MODULE_STRING(QNG_NO) "s");
-#else /* MODULE */
-
-static int parport_nr[QNG_NO] __initdata = { [0 ... QNG_NO-1] =
-					     QNG_PARPORT_UNSPEC };
-static int parport_ptr = 0;
-
-__initfunc(void qng_setup(char *str, int *ints))
-{
-	if (!str) {
-		if (ints[0] == 0 || ints[1] == 0) {
-			/* disable driver on "qng=" or "qng=0" */
-			parport_nr[0] = QNG_PARPORT_OFF;
-		}
-	} else if (!strncmp(str, "parport", 7)) {
-		int n = simple_strtoul(str+7, NULL, 10);
-		if (parport_ptr < QNG_NO)
-			parport_nr[parport_ptr++] = n;
-#if QNG_DEBUG >= 1
-		else
-			printk(KERN_INFO
-			       "qng: too many ports, %s ignored.\n", str);
-#endif
-	} else if (!strcmp(str, "auto")) {
-		parport_nr[0] = QNG_PARPORT_AUTO;
-	} else if (!strcmp(str, "none")) {
-		if (parport_ptr < QNG_NO)
-			parport_nr[parport_ptr++] = QNG_PARPORT_NONE;
-#if QNG_DEBUG >= 1
-		else
-			printk(KERN_INFO
-			       "qng: too many ports, %s ignored.\n", str);
-#endif
-	}
-}
-#endif /* else MODULE */
+MODULE_LICENSE("GPLv2");
 
 int qng_count_transitions(int nr, int time) { /* time in msec */
 	if(test_bit(QNG_HAS_INTS, &(qng_data[nr].flags))) {
@@ -492,7 +432,7 @@ int qng_register(int nr, struct parport *port)
 	if (qng_data[nr].dev == NULL)
 		return 1;
 	if(did_version++ == 0)
-		printk(KERN_INFO "%s", version);
+		printk(KERN_INFO "qng.c v0.7");
 	set_bit(QNG_PORT_CLAIMED, &(qng_data[nr].flags));
 	parport_claim(qng_data[nr].dev);
 	if (port->irq != PARPORT_IRQ_NONE) {
@@ -592,7 +532,6 @@ int qng_init(void)
 	return 0;
 }
 
-#ifdef MODULE
 int init_module(void)
 {
 	if (parport[0]) {
@@ -633,13 +572,12 @@ void cleanup_module(void)
 			parport_unregister_device(qng_data[i].dev);
 		}
 }
-#endif
 
 /*
  * Local variables:
- *  compile-command: "gcc -DMODULE -D__KERNEL__ -Wall -Wstrict-prototypes -O2 -c qng.c `[ -f /usr/include/linux/modversions.h ] && echo -DMODVERSIONS -include /usr/include/linux/modversions.h`"
  *  c-indent-level: 8
  *  c-basic-offset: 8
  *  tab-width: 8
+ *  indent-tabs-mode: t
  * End:
  */
